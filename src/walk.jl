@@ -11,9 +11,12 @@ function nextid(g, dep::Pair)
     dep_end, cpaths = walkdep(g, dep)
     @debug "Paths compatible with the dependency chain" dep_end, cpaths
     !haskey(g.index, dep_end) && return get_prop(g)
+    @debug "Last node on dependency chain found in index"
     v = g[dep_end]
     length(cpaths) == 0 && return get_prop(g)
+    @debug "The number of compatible paths is not 0"
     if outdegree(g, v) > 0
+        @debug "Not a dead end. Asigning path $(get_prop(g))"
         return get_prop(g)
     else
         neighbors = inneighbors(g, v)
@@ -39,7 +42,7 @@ end
 Check if the vertex is on the given path.
 """
 function on_path(g, v, path; dir=:in)
-    !isempty(paths_through(g, v, dir=dir) ∩ path)
+    !isempty(intersect!(paths_through(g, v, dir=dir), path))
 end
 
 """
@@ -51,14 +54,15 @@ the last node and the compatible paths.
 function walkdep(g, dep::Pair; stopcond=(g,v)->false)
     current_node = dep[1]
     remaining = dep[2]
-    compatible_paths = paths_through(g, current_node) ∪ paths_through(g, current_node, dir=:in)
+    pset = Set{eltype(g)}()
+    compatible_paths = paths_through(g, current_node, dir=:both)
     # @debug compatible_paths
     while !stopcond(g, current_node)
-        p = paths_through(g, current_node)
         if remaining isa Pair
             node = remaining[1]
-            possible_paths = paths_through(g, node, dir=:in)
-            if !isempty(possible_paths ∩ p)
+            possible_paths = paths_through!(empty!(pset), g, node, dir=:in)
+            intersect!(possible_paths, compatible_paths)
+            if !isempty(possible_paths)
                 current_node = node
                 intersect!(compatible_paths, possible_paths)
             else
@@ -66,9 +70,11 @@ function walkdep(g, dep::Pair; stopcond=(g,v)->false)
             end
             remaining = remaining[2]
         else
-            possible_paths = paths_through(g, remaining, dir=:in)
-            if !isempty(possible_paths ∩ p)
-                return remaining, intersect!(compatible_paths, possible_paths)
+            # we have reached the end of the dependency chain
+            possible_paths = paths_through!(empty!(pset), g, remaining, dir=:in)
+            intersect!(possible_paths, compatible_paths)
+            if !isempty(possible_paths)
+                return remaining, possible_paths
             else
                 return current_node, compatible_paths
             end
@@ -131,27 +137,4 @@ function walkpath!(g, path, start, neighborfn, action!; stopcond=(g,v)->false)
         start = neighbors[nexti]
     end
     return start
-end
-
-function walkcond(g, path, conditions, nodes, neighborfn; stopcond=(g,v)->false)
-    start = g[nodes[1]]
-    while !stopcond(g, start)
-        neighbors = neighborfn(g, start)
-        nexti = findfirst(n->on_path(g, n, path), neighbors)
-        if nexti isa Nothing
-            break
-        end
-        found = false
-        satisfies_cond = false
-        for (name,cond) in conditions
-            if has_prop(g, start, name)
-                found = true
-                satisfies_cond = cond(g[start])
-                break
-            end
-        end
-        (found && !satisfies_cond) && return false
-        start = neighbors[nexti]
-    end
-    return true
 end

@@ -1,27 +1,37 @@
 import Base: getindex, getproperty
+using Base.Threads
 
 function getindex(g::StorageGraph, v::Integer)
     get_prop(g, v)
 end
 
 function getindex(g::StorageGraph, dep::Pair)
-    paths = paths_through(g, dep)
-    neighbors = final_neighborhs(g, dep)
-    Iterators.filter(v->on_path(g, v, paths), neighbors)
+    (lastn, cpaths), t = @timed walkdep(g, dep)
+    @debug "Finding last node on path took $t seconds."
+    if lastn == endof(dep) && length(cpaths) ≠ 0
+        neighbors = outneighbors(g, lastn)
+        mask = Vector{Bool}(undef, length(neighbors))
+        @threads for i in eachindex(neighbors)
+            mask[i] = on_path(g, neighbors[i], cpaths)
+        end
+        return neighbors[mask]
+    else
+        return eltype(g)[]
+    end
 end
 
-function getindex(g::StorageGraph, dep::Pair, name::Symbol)
+function getindex(g::StorageGraph, name::Symbol, dep::Pair)
     get.(get_prop.(Ref(g), g[dep]), name, nothing)
 end
 
-function getindex(g::StorageGraph, f::Function, nodes::Vararg{NamedTuple})
-    paths = filter_paths(g, f, nodes...)
-    vs = Iterators.filter(v->on_path(g,v,paths), outneighbors(g, g[nodes[end]]))
+function getindex(g::StorageGraph, conditions::Dict{Symbol,F}, nodes::Vararg{NamedTuple}) where {F<:Function}
+    paths = filter_paths(g, nodes, conditions)
+    vs = Iterators.filter(v->on_path(g,v,paths), outneighbors(g, nodes[end]))
     get_prop.(Ref(g), vs)
 end
 
-function getindex(g::StorageGraph, name::Symbol, f::Function, nodes::Vararg{NamedTuple})
-    paths = filter_paths(g, f, nodes...)
+function getindex(g::StorageGraph, name::Symbol, conditions::Dict{Symbol,F}, nodes::Vararg{NamedTuple}) where {F<:Function}
+    paths = filter_paths(g, nodes, conditions)
     outn = outneighbors(g, g[nodes[end]])
     i = findfirst(n->has_prop(g, n, name), outn)
     if i === nothing
@@ -31,13 +41,13 @@ function getindex(g::StorageGraph, name::Symbol, f::Function, nodes::Vararg{Name
     else
         # there is no need to traverse the graph if the last given node has the
         # desired nodes as outneighbors
-        vs = Iterators.filter(v->on_path(g,v,paths), outn)
+        vs = filter(v->on_path(g,v,paths), outn)
     end
     get.(get_prop.(Ref(g), vs), name, nothing)
 end
 
 function getindex(g::StorageGraph, nodes::Vararg{NamedTuple})
-    return getindex(g, (g,p,n)->true, nodes...)
+    return getindex(g, Dict{Symbol,Function}(), nodes...)
 end
 
 function getindex(g::StorageGraph, data::NamedTuple)
@@ -45,7 +55,7 @@ function getindex(g::StorageGraph, data::NamedTuple)
 end
 
 function getindex(g::StorageGraph, name::Symbol, nodes::Vararg{NamedTuple})
-    getindex(g, name, (g,p,n)->true, nodes...)
+    getindex(g, name, Dict{Symbol,Function}(), nodes...)
 end
 
 function getindex(g::StorageGraph, names::NTuple{N, Symbol}, nodes::Vararg{NamedTuple}) where {N}
@@ -64,37 +74,51 @@ getindex(g::StorageGraph) = []
 Return a vector of the paths going through the given vertex. If `dir` is specified,
 use the corresponding edge direction (`:in` and `:out` are acceptable values).
 """
-function paths_through(g, v::Integer; dir=:out)
-    v == 0 && return Set{Int}()
+paths_through(g, v; dir=:out) = paths_through!(Set{eltype(g)}(), g, v, dir=dir)
+
+function paths_through!(paths, g, v::Integer; dir=:out)
+    v == 0 && return paths
     if dir == :out
         out = outneighbors(g, v)
         if isempty(out)
-            return Int[]
+            return paths
         else
             es = [Edge(v, i) for i in out]
         end
-    else
+    elseif dir == :in
         in = inneighbors(g, v)
         if isempty(in)
-            return Int[]
+            return paths
         else
             es = [Edge(i, v) for i in in]
         end
+    else
+        in = inneighbors(g, v)
+        out = outneighbors(g, v)
+        l = length(in)
+        n = l + length(out)
+        n == 0 && return paths
+        es = Vector{Edge}(undef, n)
+        for i in eachindex(in)
+            es[i] = Edge(in[i], v)
+        end
+        for i in eachindex(out)
+            es[i+l] = Edge(v, out[i])
+        end
     end
-    paths = Set{Int}()
     for e in es
         union!(paths, g.paths[e])
     end
     return paths
 end
 
-function paths_through(g, dep::Pair; dir=:out)
-    intersect(paths_through(g, dep[2], dir=dir), paths_through(g, dep[1], dir=dir))
+function paths_through!(paths, g, dep::Pair; dir=:out)
+    intersect!(paths_through!(Set{eltype(g)}(), g, dep[2], dir=dir), paths_through!(paths, g, dep[1], dir=dir))
 end
 
-function paths_through(g, node::NamedTuple; dir=:out)
-    !haskey(g.index, node) && return Int[]
-    paths_through(g, g[node], dir=dir)
+function paths_through!(paths, g, node::NamedTuple; dir=:out)
+    !haskey(g.index, node) && return paths
+    paths_through!(paths, g, g[node], dir=dir)
 end
 
 """
@@ -127,19 +151,26 @@ function extractvals(nodes, name::Symbol)
     [n[name] for n in nodes]
 end
 
-function filter_paths(g, f, nodes...)
-    filter(p->f(g,p,nodes), intersect(paths_through.(Ref(g), nodes)...))
-end
-
-function with(g::StorageGraph, name::Symbol, cond::Function)
-    (g,p,n)->begin
-        v = walkpath(g, p, g[n[1]], stopcond=(g,v)->has_prop(g,v,name))
-        cond(g[v])
+function filter_paths!(paths, g, conditions)
+    for (name, cond) in conditions
+        target = findnodes(g, name)
+        valid_vals = target[cond.(target)]
+        all_valid_paths = paths_through.(Ref(g), valid_vals)
+        valid_paths = Set{eltype(g)}()
+        for p in all_valid_paths
+            union!(valid_paths, p)
+        end
+        intersect!(paths, valid_paths)
     end
 end
 
-function with(g::StorageGraph, conditions::Dict{Symbol,T}; stopcond=(g,v)->false) where {T<:Function}
-    (g,path,nodes) -> begin
-        walkcond(g, path, conditions, nodes, outneighbors; stopcond=stopcond)
+function filter_paths(g, nodes, conditions)
+    possible_paths = paths_through.(Ref(g), nodes)
+    paths = possible_paths[1]
+    for p in possible_paths
+        intersect!(paths, p)
     end
+    filter_paths!(paths, g, conditions)
+
+    return paths
 end

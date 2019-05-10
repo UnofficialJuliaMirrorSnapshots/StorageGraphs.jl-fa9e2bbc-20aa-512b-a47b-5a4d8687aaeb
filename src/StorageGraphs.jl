@@ -1,8 +1,8 @@
 module StorageGraphs
 
-export StorageGraph, add_nodes!, add_derived_values!, add_bulk!,
+export StorageGraph, add_nodes!, add_bulk!,
     nextid, paths_through, on_path, walkpath, walkdep, final_neighborhs,
-    get_prop, has_prop, set_prop!, with, plot_graph,
+    get_prop, has_prop, set_prop!, plot_graph,
     SGNativeFormat, SGJLDFormat, SGBSONFormat
 
 using LightGraphs
@@ -10,7 +10,9 @@ using LightGraphs.SimpleGraphs: SimpleEdge
 
 using GraphPlot
 
-struct StorageGraph{T<:Integer, N<:NamedTuple} <: AbstractGraph{T}
+abstract type AbstractStorageGraph{T} <: AbstractGraph{T} end
+
+struct StorageGraph{T<:Integer, N<:NamedTuple} <: AbstractStorageGraph{T}
     graph::SimpleDiGraph{T}
     data::Dict{T,N}
     paths::Dict{SimpleEdge{T},Set{T}}
